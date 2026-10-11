@@ -1316,6 +1316,25 @@ pub fn attachment_data(bytes: &[u8], password: Option<&str>, att: &Attachment) -
 #[cfg(test)]
 mod tests {
     #[test]
+    fn huge_page_tree_counts_do_not_preallocate() {
+        // Vendored lopdf patch (`cargo xtask fuzz`): `get_pages` collected through an exact
+        // size hint taken from `/Count`, so `/Count 4294967295` on an intermediate node asked
+        // for 48 GiB and aborted the process on open (an abort escapes catch_unwind).
+        for count in ["4294967295", "9223372036854775807"] {
+            let pdf = format!(
+                "%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n\
+                 3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n\
+                 4 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count {count} >>\nendobj\n\
+                 5 0 obj\n<< /Type /Page /Parent 4 0 R /MediaBox [0 0 300 300] >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+            );
+            let doc = lopdf::Document::load_mem(pdf.as_bytes()).unwrap();
+            assert_eq!(doc.get_pages().len(), 2, "/Count {count}");
+            let info = super::inspect(std::sync::Arc::new(pdf.into_bytes()), None).unwrap();
+            assert_eq!(info.pages.len(), 2, "/Count {count}");
+        }
+    }
+
+    #[test]
     fn png_predictor_rows_longer_than_the_data_are_refused_before_allocating() {
         // Vendored lopdf patch: a fuzzed `/Columns 4294967295` allocated two 4 GiB rows before
         // reading any data. A row that cannot fit in the data is refused up front.

@@ -68,6 +68,17 @@ pub struct Revision {
     pub xref_offset: u64,
     /// `true` if the section is a cross-reference stream.
     pub is_stream: bool,
+    /// The section was found at `xref_offset` counted from the `%PDF-` header rather than
+    /// from the start of the file (files with junk before the header use either convention).
+    pub(crate) header_relative: bool,
+}
+
+impl Revision {
+    /// Where the section starts in the file's bytes.
+    fn file_offset(&self, header_offset: usize) -> usize {
+        let at = usize::try_from(self.xref_offset).unwrap_or(usize::MAX);
+        if self.header_relative { at.saturating_add(header_offset) } else { at }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -333,8 +344,9 @@ impl Document {
             doc.authenticate(&enc, password)?;
         }
         let max = doc.entries.keys().next_back().copied().unwrap_or(0);
-        let size = doc.trailer.int(b"Size").unwrap_or(0).max(0) as u32;
-        doc.next_num = max.max(size.saturating_sub(1)) + 1;
+        let size = u32::try_from(doc.trailer.int(b"Size").unwrap_or(0).max(0)).unwrap_or(u32::MAX);
+        // Saturating: a file can use object number u32::MAX; `allocate_num` then reuses gaps.
+        doc.next_num = max.max(size.saturating_sub(1)).saturating_add(1);
         Ok(doc)
     }
 
@@ -522,7 +534,9 @@ impl Document {
         let d = &self.data[..];
         let mut ends: Vec<usize> = Vec::with_capacity(self.revisions.len());
         for r in self.revisions.iter() {
-            let from = (r.xref_offset as usize).saturating_add(self.header_offset).min(d.len());
+            // Search from where the section was actually read: offsets are absolute in most
+            // files with junk before the header, header-relative in others.
+            let from = r.file_offset(self.header_offset).min(d.len());
             let Some(at) = d[from..].windows(5).position(|w| w == b"%%EOF") else { continue };
             let mut end = from + at + 5;
             while end < d.len() && matches!(d[end], b'\r' | b'\n') && end - (from + at + 5) < 2 {
@@ -763,17 +777,46 @@ impl Document {
         let obj = self.adopt(obj.into());
         self.overlay.insert(r.num, Slot::Set(r.generation, Arc::new(obj)));
         if r.num >= self.next_num {
-            self.next_num = r.num + 1;
+            self.next_num = r.num.saturating_add(1);
         }
     }
 
     /// Add a new indirect object and return its reference.
     pub fn add(&mut self, obj: impl Into<Object>) -> ObjRef {
-        let r = ObjRef::new(self.next_num, 0);
-        self.next_num += 1;
+        let r = ObjRef::new(self.allocate_num(), 0);
         let obj = self.adopt(obj.into());
         self.overlay.insert(r.num, Slot::Set(0, Arc::new(obj)));
         r
+    }
+
+    /// A number for a new object. Normally the next one after every number in use; when a
+    /// (damaged or hostile) file already uses `u32::MAX`, the lowest number nothing uses.
+    /// Never 0, which is reserved for the head of the free list (§7.5.4).
+    fn allocate_num(&mut self) -> u32 {
+        let n = self.next_num.max(1);
+        if n < u32::MAX || !self.number_in_use(n) {
+            self.next_num = n.saturating_add(1);
+            return n;
+        }
+        // Both maps are ordered: walk their merged keys for the first gap after 0.
+        let mut used: Vec<u32> = self.entries.keys().chain(self.overlay.keys()).copied().collect();
+        used.sort_unstable();
+        used.dedup();
+        let mut candidate = 1u32;
+        for k in used {
+            if k < candidate {
+                continue;
+            }
+            if k > candidate {
+                break;
+            }
+            candidate = candidate.saturating_add(1);
+        }
+        candidate
+    }
+
+    fn number_in_use(&self, num: u32) -> bool {
+        self.entries.contains_key(&num) || self.overlay.contains_key(&num)
     }
 
     /// Delete an object (its number becomes free with the next generation).
@@ -874,12 +917,14 @@ impl Document {
             }
             // This section's own entries; older sections only fill what newer ones left out.
             let mut sect = BTreeMap::new();
+            let mut header_relative = false;
             let (sect_trailer, is_stream) = match self.read_section(off as usize, &mut sect) {
                 Ok(v) => v,
                 Err(e) if self.header_offset > 0 => {
                     log.push(format!("xref at {off} unreadable ({e}); retrying relative to the header"));
                     sect.clear();
-                    self.read_section(off as usize + self.header_offset, &mut sect)?
+                    header_relative = true;
+                    self.read_section((off as usize).saturating_add(self.header_offset), &mut sect)?
                 }
                 Err(e) => {
                     if revisions.is_empty() {
@@ -889,7 +934,7 @@ impl Document {
                     break;
                 }
             };
-            revisions.push(Revision { xref_offset: off, is_stream });
+            revisions.push(Revision { xref_offset: off, is_stream, header_relative });
             // Hybrid files (§7.5.8.4): the /XRefStm entries supplement the table and replace the
             // free entries it gives objects only a cross-reference stream can locate.
             if let Some(x) = sect_trailer.int(b"XRefStm").filter(|x| *x >= 0) {
@@ -1431,6 +1476,92 @@ mod tests {
         assert!(doc.repair_log().is_empty(), "{:?}", doc.repair_log());
         let hidden = doc.get(ObjRef::new(3, 0));
         assert_eq!(hidden.as_dict().and_then(|d| d.get(b"Hidden").and_then(|h| h.as_string().map(|s| s.to_text()))), Some("yes".into()));
+    }
+
+    /// From `cargo test` fuzzing: an object numbered `u32::MAX` overflowed `next_num` (a panic
+    /// in debug builds; in release the next new object became object 0, which other readers
+    /// treat as null, so the edit was lost from their view).
+    #[test]
+    fn the_largest_object_number_does_not_overflow_new_object_numbers() {
+        let reconstructed = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n4294967295 0 obj\n<< /X 1 >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n".to_vec();
+        let mut table = b"%PDF-1.7\n".to_vec();
+        let o1 = table.len();
+        table.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let o2 = table.len();
+        table.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let o3 = table.len();
+        table.extend_from_slice(b"4294967295 0 obj\n<< /X 1 >>\nendobj\n");
+        let x = table.len();
+        table.extend_from_slice(
+            format!("xref\n0 3\n0000000000 65535 f \n{o1:010} 00000 n \n{o2:010} 00000 n \n4294967295 1\n{o3:010} 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{x}\n%%EOF\n").as_bytes(),
+        );
+        for bytes in [reconstructed, table] {
+            let mut doc = Document::open(Arc::new(bytes)).unwrap();
+            let added: Vec<ObjRef> = (0..3).map(|i| doc.add(Object::Int(i))).collect();
+            for (i, r) in added.iter().enumerate() {
+                assert!(r.num != 0, "object 0 is the free-list head");
+                assert_eq!(doc.get(*r).as_int(), Some(i as i64), "{r:?} must not overwrite another object");
+            }
+            assert!(added.windows(2).all(|w| w[0].num != w[1].num), "{added:?}");
+            assert_eq!(doc.get(ObjRef::new(u32::MAX, 0)).as_dict().unwrap().int(b"X"), Some(1));
+            assert_eq!(doc.get(ObjRef::new(1, 0)).as_dict().unwrap().name(b"Type"), Some(b"Catalog".as_slice()));
+            // set() at the top of the range must not overflow either.
+            doc.set(ObjRef::new(u32::MAX, 0), Object::Int(7));
+            let r = doc.root().unwrap();
+            doc.update_dict(r, |d| d.set(b"Added".to_vec(), Object::Ref(added[0]))).unwrap();
+            let saved = crate::write_incremental(&doc, &crate::SaveOptions::default()).unwrap();
+            let re = Document::open(Arc::new(saved)).unwrap();
+            let link = re.get(re.root().unwrap()).as_dict().unwrap().get(b"Added").cloned().unwrap();
+            assert!(matches!(link, Object::Ref(r) if r.num != 0), "{link:?}");
+            assert_eq!(re.resolve(&link).as_int(), Some(0));
+        }
+    }
+
+    /// Junk before `%PDF-` with absolute offsets (the usual case): each revision must end at
+    /// its own `%%EOF`. Searching from offset + header shift skipped short sections, so
+    /// "revision 1" opened revision 2 and the original could not be reached.
+    #[test]
+    fn revision_ends_with_junk_before_the_header() {
+        for (junk, header_relative) in [(150usize, false), (600, false), (150, true)] {
+            let base = if header_relative { 0 } else { junk };
+            let mut body = b"%PDF-1.7\n".to_vec();
+            let o1 = base + body.len();
+            body.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+            let o2 = base + body.len();
+            body.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+            let x = base + body.len();
+            body.extend_from_slice(
+                format!("xref\n0 3\n0000000000 65535 f \n{o1:010} 00000 n \n{o2:010} 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{x}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            let mut bytes = vec![b'J'; junk];
+            bytes.extend_from_slice(&body);
+            let first = bytes.len();
+            let mut titles = vec![String::new()];
+            for t in ["rev2", "rev3"] {
+                let mut doc = Document::open(Arc::new(bytes)).unwrap();
+                let r = doc.root().unwrap();
+                doc.update_dict(r, |c| c.set(b"Title".to_vec(), Object::String(crate::PdfString::literal(t)))).unwrap();
+                bytes = crate::write_incremental(&doc, &crate::SaveOptions::default()).unwrap();
+                titles.push(t.to_string());
+            }
+            let doc = Document::open(Arc::new(bytes.clone())).unwrap();
+            let ends = doc.revision_ends();
+            assert_eq!(ends.len(), 3, "junk {junk}, header-relative {header_relative}: {ends:?}");
+            assert_eq!(ends[0], first);
+            assert_eq!(ends[2], bytes.len());
+            for (end, title) in ends.iter().zip(&titles) {
+                let old = Document::open(Arc::new(bytes[..*end].to_vec())).unwrap();
+                let got = old
+                    .get(old.root().unwrap())
+                    .as_dict()
+                    .unwrap()
+                    .get(b"Title")
+                    .and_then(|t| t.as_string().map(|s| s.to_text()))
+                    .unwrap_or_default();
+                assert_eq!(&got, title, "junk {junk}, header-relative {header_relative}");
+            }
+        }
     }
 
     #[test]

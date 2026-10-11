@@ -124,8 +124,11 @@ impl<'a> Lexer<'a> {
                             let before = self.pos;
                             match self.object_depth(depth + 1) {
                                 Ok(o) => items.push(o),
-                                // Tolerate junk inside arrays by skipping one byte.
+                                // Tolerate junk inside arrays the way dictionaries do: skip the bad
+                                // token (or one byte, when nothing was consumed) and go on. Running
+                                // out of data is still an error.
                                 Err(_) if self.pos == before => self.pos += 1,
+                                Err(_) if self.peek().is_some() => {}
                                 Err(e) => return Err(e),
                             }
                         }
@@ -329,6 +332,7 @@ impl<'a> Lexer<'a> {
                 // found ".—", which panicked here).
                 if cleaned.is_char_boundary(end)
                     && let Ok(v) = cleaned[..end].parse::<f64>()
+                    && v.is_finite()
                 {
                     return Ok(Object::Real(v));
                 }
@@ -340,7 +344,12 @@ impl<'a> Lexer<'a> {
             Ok(v) => Ok(Object::Int(v)),
             Err(_) => {
                 // Out-of-range integers are treated as reals (§7.3.3 allows implementation limits).
-                s.parse::<f64>().map(Object::Real).map_err(|_| CosError::Syntax { offset: start, detail: format!("bad number {s:?}") })
+                // PDF has no NaN or infinity: Rust's float parser accepts "nan", "-inf" and
+                // overflowing exponents, which are not PDF numbers.
+                match s.parse::<f64>() {
+                    Ok(v) if v.is_finite() => Ok(Object::Real(v)),
+                    _ => Err(CosError::Syntax { offset: start, detail: format!("bad number {s:?}") }),
+                }
             }
         }
     }
@@ -542,6 +551,28 @@ mod tests {
         let (_, o) = parse_indirect(data, 0, &|r| (r.num == 8).then_some(2)).unwrap();
         let Object::Stream(s) = o else { panic!() };
         assert_eq!(&s.raw[..], b"AB");
+    }
+
+    #[test]
+    fn junk_tokens_inside_arrays_are_skipped() {
+        let ints = |v: &[i64]| Object::Array(v.iter().map(|i| Object::Int(*i)).collect());
+        assert_eq!(obj("[1 foo 2]"), ints(&[1, 2]));
+        assert_eq!(obj("[1 - 2]"), ints(&[1, 2]));
+        assert_eq!(obj("[0 0 612 792 x]"), ints(&[0, 0, 612, 792]));
+        let page = obj("<< /Type /Page /MediaBox [0 0 612 bad 792] /Rotate 90 >>");
+        assert_eq!(page.as_dict().unwrap().int(b"Rotate"), Some(90), "one bad token must not lose the dictionary");
+        // Running out of data is still an error.
+        assert!(Lexer::new(b"[1 foo", 0).object().is_err());
+        assert!(Lexer::new(b"[1 (open", 0).object().is_err());
+    }
+
+    #[test]
+    fn nan_and_infinity_are_not_numbers() {
+        for t in ["nan", "+nan", "-NaN", "-inf", "+infinity", "1e999", "-inf.", "+nan.5"] {
+            let r = Lexer::new(t.as_bytes(), 0).object();
+            assert!(!matches!(r, Ok(Object::Real(v)) if !v.is_finite()), "{t}: {r:?}");
+        }
+        assert_eq!(obj("[1 -inf 2]"), Object::Array(vec![Object::Int(1), Object::Int(2)]));
     }
 
     #[test]
